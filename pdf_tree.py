@@ -78,10 +78,11 @@ def _lines(page):
                 }
 
 
-def parse(path: str):
-    """Returns (title, nodes, doc_warnings). Nodes are in document order."""
-    doc = fitz.open(path)
+def parse(src: str | bytes):
+    """Path or PDF bytes -> (title, nodes, doc_warnings). Nodes are in document order."""
+    doc = fitz.open(src) if isinstance(src, str) else fitz.open(stream=src, filetype="pdf")
     title, nodes, doc_warnings = [], [], []
+    margin = float("inf")  # x of the leftmost heading seen so far
     by_number: dict[str, int] = {}
     seen_heading: dict[str, str] = {}
     prev = None  # previous body line, for paragraph joining: (page, y1, text)
@@ -112,6 +113,7 @@ def parse(path: str):
             m = HEADING.match(line["text"]) if line["bold"] else None
             if m:
                 nodes.append(_new_node(m.group(1), m.group(2), pno, nodes, by_number, seen_heading))
+                margin = min(margin, line["x"])
                 prev = None
                 continue
             if cur is None:
@@ -122,6 +124,9 @@ def parse(path: str):
                 continue
 
             last = cur.blocks[-1] if cur.blocks else None
+            if HEADING.match(line["text"]) and line["x"] <= margin + 2:
+                # Not bold, so kept as body; but numbered list items are indented and this is not.
+                cur.warnings.append(f"possible unstyled heading kept as body text: {line['text'][:60]!r}")
             if LIST_ITEM.match(line["text"]):
                 if last is None or last["type"] != "list":
                     last = {"type": "list", "items": [], "x": line["x"]}
