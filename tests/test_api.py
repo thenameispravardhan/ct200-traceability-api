@@ -73,9 +73,9 @@ def test_invalid_output_is_rejected_and_not_stored(monkeypatch):
 def test_generation_for_inflation_section(monkeypatch):
     n32 = nid("3.2")
     sel = c.post("/selections", json={"name": "inflation", "node_ids": [n32]}).json()
-    cases = [tc("Inflates in 40 mmHg increments up to 299 mmHg", n32),
-             tc("Deflates in controlled steps of approximately 3 mmHg", n32),
-             tc("Deflation steps are approximately 3 mmHg", n32)]
+    cases = [tc("Inflates in 40 mmHg increments", n32),
+             tc("Aborts with an error above a maximum of 299 mmHg", n32),
+             tc("Deflates in controlled steps of approximately 3 mmHg", n32)]
     monkeypatch.setattr(llm, "complete", lambda messages: json.dumps({"test_cases": cases}))
     S["gen32"] = c.post(f"/selections/{sel['id']}/generations").json()
 
@@ -106,7 +106,9 @@ def test_v2_reingest_flags_changes_and_staleness():
         assert case["staleness"] == want, case
     assert [x["id"] for x in c.get(f"/nodes/{nid('4.2', 2)}/generations").json()] == [S["gen"]["id"]]
 
-    # 3.2 still contains "40 mmHg" in v2, but the increment sentence was rewritten: that test is stale.
+    # 3.2 still contains "40 mmHg" in v2, but the increment sentence now says 30: that test is stale.
+    # 299 mmHg sits in the same rewritten sentence but survived the rewrite: review, not stale.
     g32 = c.get(f"/generations/{S['gen32']['id']}").json()
     assert [t["staleness"] for t in g32["test_cases"]] == ["stale", "review", "review"]
-    assert "40 mmhg" in g32["test_cases"][0]["invalidated_facts"]
+    assert g32["test_cases"][0]["invalidated_facts"] == ["40 mmhg"]
+    assert g32["staleness"]["sources"][0]["invalidated_facts"] == ["40 mmhg"]

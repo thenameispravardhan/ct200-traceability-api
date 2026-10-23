@@ -108,13 +108,14 @@ def change_summary(old: str, new: str) -> dict:
     was added or removed, else 'wording'. Heuristic: see APPROACH.md for what it misses."""
     fo, fn = _facts(old), _facts(new)
     removed, added = sorted((fo - fn).elements()), sorted((fn - fo).elements())
-    sent = lambda t: [s for s in re.split(r"(?<=[.;])\s+|\n+", t) if s.strip()]
-    diff = [l for l in difflib.unified_diff(sent(old), sent(new), lineterm="", n=0)
+    os_, ns = _sentences(old), _sentences(new)
+    diff = [l for l in difflib.unified_diff(os_, ns, lineterm="", n=0)
             if l[:1] in "+-" and not l.startswith(("+++", "---"))]
     return {
         "severity": "material" if removed or added else "wording",
         "facts_removed": removed,
         "facts_added": added,
+        "invalidated_facts": _invalidated(os_, ns),
         "similarity": round(difflib.SequenceMatcher(None, old.split(), new.split()).ratio(), 3),
         "diff": diff,
     }
@@ -126,7 +127,7 @@ def staleness(db: Session, gen: dict) -> dict:
     Per source node: current (hash equal) | changed (+ diff summary) | removed (no longer matched).
     Per test case, over the nodes it cites:
       stale   - a cited node was removed, or a fact this test itself asserts (value, code,
-                requirement word) sits in a sentence of a cited node that was rewritten or deleted;
+                requirement word) was dropped from its sentence by a rewrite or deletion;
       review  - a cited node changed, but not in anything this test asserts;
       current - every cited node is byte-for-byte the same text (hash equal).
     Nothing is auto-cleared: the token heuristic can miss a meaning change without numbers.
@@ -148,9 +149,7 @@ def staleness(db: Session, gen: dict) -> dict:
     for tc in gen["test_cases"]:
         cited = [by_id[i] for i in tc["source_node_ids"]]
         asserted = _anchors(_facts(" ".join([tc["title"], *tc["steps"], tc["expected_result"]])))
-        # Facts in old sentences that were rewritten or deleted. Not just tokens that vanished:
-        # 3.2 in v2 still says "40 mmHg", but no longer as the increment.
-        touched = _anchors(f for c in cited for l in c.get("diff", []) if l[:1] == "-" for f in _facts(l[1:]))
+        touched = _anchors(f for c in cited for f in c.get("invalidated_facts", []))
         broken = sorted(asserted & touched)
         if broken or any(c["status"] == "removed" for c in cited):
             status = "stale"
@@ -165,6 +164,29 @@ def staleness(db: Session, gen: dict) -> dict:
         "generated_from_version": gen["version"],
         "sources": list(by_id.values()),
     }}
+
+
+def _sentences(text: str) -> list[str]:
+    return [s for s in re.split(r"(?<=[.;])\s+|\n+", text) if s.strip()]
+
+
+def _sim(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a.split(), b.split()).ratio()
+
+
+def _invalidated(old: list[str], new: list[str]) -> list[str]:
+    """Facts an old sentence stated that its rewrite no longer states (all of them if it was deleted).
+    3.2: '...in 40 mmHg increments up to 299 mmHg...' -> '...in 30 mmHg increments up to 299 mmHg...'
+    invalidates only '40 mmHg', even though v2 still mentions 40 mmHg in an added sentence."""
+    out = Counter()
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old, new).get_opcodes():
+        if op in ("replace", "delete"):
+            for s in old[i1:i2]:
+                best = max(new[j1:j2], key=lambda t: _sim(s, t), default=None)
+                # ponytail: 0.5 word-overlap pairs a rewrite with its original; a rewrite that changes
+                # more than half its words counts as deleted (all its facts invalidated), the safe side.
+                out += _facts(s) - (_facts(best) if best and _sim(s, best) >= 0.5 else Counter())
+    return sorted(out)
 
 
 def _facts(text: str) -> Counter:
