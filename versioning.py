@@ -124,9 +124,12 @@ def staleness(db: Session, gen: dict) -> dict:
     """Compare the text a generation was made from with the same logical nodes in the latest version.
 
     Per source node: current (hash equal) | changed (+ diff summary) | removed (no longer matched).
-    Per test case, over the nodes it cites: stale if any is removed or materially changed,
-    review if only wording changed, else current. Wording changes are never auto-cleared:
-    the heuristic can miss a meaning change that involves no number or requirement word.
+    Per test case, over the nodes it cites:
+      stale   - a cited node was removed, or a fact this test itself asserts (value, code,
+                requirement word) sits in a sentence of a cited node that was rewritten or deleted;
+      review  - a cited node changed, but not in anything this test asserts;
+      current - every cited node is byte-for-byte the same text (hash equal).
+    Nothing is auto-cleared: the token heuristic can miss a meaning change without numbers.
     """
     latest = latest_version(db, gen["document"])
     cur = {n.logical_id: n for n in nodes_of(db, latest.id)}
@@ -141,18 +144,23 @@ def staleness(db: Session, gen: dict) -> dict:
             st = {"status": "changed", "current_node_id": n.id, **change_summary(s["text"], n.text)}
         by_id[s["node_id"]] = {"node_id": s["node_id"], "number": s["number"], "heading": s["heading"], **st}
 
-    def verdict(states):
-        if any(st["status"] == "removed" or st.get("severity") == "material" for st in states):
-            return "stale"
-        return "review" if any(st["status"] == "changed" for st in states) else "current"
-
     cases = []
     for tc in gen["test_cases"]:
         cited = [by_id[i] for i in tc["source_node_ids"]]
-        cases.append({**tc, "staleness": verdict(cited),
+        asserted = _anchors(_facts(" ".join([tc["title"], *tc["steps"], tc["expected_result"]])))
+        # Facts in old sentences that were rewritten or deleted. Not just tokens that vanished:
+        # 3.2 in v2 still says "40 mmHg", but no longer as the increment.
+        touched = _anchors(f for c in cited for l in c.get("diff", []) if l[:1] == "-" for f in _facts(l[1:]))
+        broken = sorted(asserted & touched)
+        if broken or any(c["status"] == "removed" for c in cited):
+            status = "stale"
+        else:
+            status = "review" if any(c["status"] == "changed" for c in cited) else "current"
+        cases.append({**tc, "staleness": status, "invalidated_facts": broken,
                       "changed_sources": [c["number"] for c in cited if c["status"] != "current"]})
+    worst = max((c["staleness"] for c in cases), key=["current", "review", "stale"].index)
     return {**gen, "test_cases": cases, "staleness": {
-        "status": verdict(by_id.values()),
+        "status": worst,
         "checked_against_version": latest.number,
         "generated_from_version": gen["version"],
         "sources": list(by_id.values()),
@@ -161,3 +169,9 @@ def staleness(db: Session, gen: dict) -> dict:
 
 def _facts(text: str) -> Counter:
     return Counter(" ".join(m.group().lower().split()) for m in FACT.finditer(text))
+
+
+def _anchors(facts) -> set[str]:
+    # "2 seconds" and "2 second" are the same claim. ponytail: "2 s" vs "2 seconds" won't match,
+    # which downgrades stale -> review (never -> current); add a unit synonym table if that bites.
+    return {f.rstrip("s") for f in facts}

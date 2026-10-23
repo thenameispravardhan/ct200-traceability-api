@@ -84,7 +84,8 @@ print(f"  overall: {g['staleness']['status']} (generated from v{g['staleness']['
 for s in g["staleness"]["sources"]:
     print(f"    source {s['number']:<4} {s['status']:<8} {s.get('severity', '')}")
 for tc in g["test_cases"]:
-    print(f"  {tc['id']} -> {tc['staleness']:<8} changed sources: {tc['changed_sources']}")
+    print(f"  {tc['id']} -> {tc['staleness']:<8} changed sources: {tc['changed_sources']} "
+          f"invalidated facts: {tc['invalidated_facts']}")
 
 step("10. Retrieve by node: generations that used section 4.2 (queried with its v2 node id)")
 v2_42 = h["versions"][-1]["node_id"]
