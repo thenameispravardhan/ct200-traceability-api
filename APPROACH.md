@@ -1,4 +1,60 @@
-# Approach
+# CT-200 Traceability API: Approach
+
+Repository: https://github.com/thenameispravardhan/ct200-traceability
+
+## 0. At a glance
+
+**Problem.** A medical-device manual changes between revisions. QA test cases written against the
+old text quietly stop being true ("auto-deflates within 2 seconds" when v2 says 1.5). The system
+has to notice this, per test case, and say why.
+
+```
+POST /documents/{doc}/versions   (raw PDF)
+  -> pdf_tree.parse ............ section nodes + irregularity warnings
+  -> versioning.ingest ......... SQLite: version, immutable node rows,
+                                 logical_id matched to the previous version,
+                                 diff + invalidated facts per changed section
+POST /selections ............... version-pinned set of node rows
+POST /selections/{id}/generations
+  -> llm.generate .............. JSON -> schema, citation, grounding checks
+                                 retry x3; still invalid -> 502, nothing stored
+  -> generations/<id>.json ..... exact source text + hashes copied in
+GET  /selections/{id}/generations   (or /nodes/{id}/generations)
+  -> versioning.staleness ...... against the latest version, per test case:
+                                 current | review | stale (+ invalidated facts)
+```
+
+**Result on the real v1 → v2 manuals:**
+
+| Measure | Result |
+|---|---|
+| Sections parsed | 27 in v1, 28 in v2; every irregularity flagged, none silently repaired |
+| v2 re-ingestion | 23 unchanged, 4 modified (2.1.1.1, 3.2, 4.2, 4.3), 1 added (5.3), 0 removed; no false changes from page breaks |
+| Facts each change invalidates | 2.1.1.1: `300`, `15%` · 3.2: `40 mmHg` · 4.2: `2 seconds` · 4.3: `E5` |
+| Test cases from table 4.2 | the E3 test (asserts "2 seconds") → **stale**; E1, E2, E4, E5 tests → **review** |
+| Tests | 12 (6 parser irregularity tests, 6 end-to-end API tests including the LLM failure modes) |
+
+**Three ideas that carry the design:**
+
+1. **Numbering is identity, styling is evidence.** Headings are found by bold + section number,
+   never font size. Parents come from the number prefix, so out-of-order and level-skipping
+   sections still land in the right place, with a warning.
+2. **An LLM answer is untrusted input.** It must parse, match the schema, cite only sections it
+   was given, and only assert numbers those sections contain. If any check fails, the model is
+   told exactly why and retried. After 3 failures nothing is stored.
+3. **Staleness is a property of a claim, not of a section.** Each changed sentence is paired with
+   its rewrite to find exactly which facts were dropped. A test goes stale only if it asserts one
+   of those facts. Nothing is ever auto-cleared: any change to a cited section means at least
+   `review`.
+
+**Run it** (with no API key it uses a labelled offline stub; set `LLM_API_KEY` for a real model):
+
+```
+pip install -r requirements.txt
+pytest -q                  # 12 tests
+uvicorn main:app           # then, in a second terminal:
+python demo.py             # v1 -> selection -> generation -> v2 -> staleness
+```
 
 ## 1. Document parsing
 
@@ -175,6 +231,9 @@ On v1 → v2 this gives: 23 unchanged, 4 modified (2.1.1.1, 3.2, 4.2, 4.3), 1 ad
   tokens are numbers with units (`2 seconds`, `15%`, `40 mmHg`), codes (`E6`) and requirement words
   (`not`, `cannot`, `must`, `only`, `except`, `within`, `before`, ...);
 - the facts removed and added;
+- **`invalidated_facts`**: facts that an old sentence stated and its rewrite no longer states. Each
+  rewritten old sentence is paired with its most similar new sentence (word overlap ≥ 0.5) and their
+  facts are compared. A sentence with no partner counts as deleted, so all its facts are invalidated;
 - word-level similarity;
 - the changed sentences as `-`/`+` lines.
 
@@ -188,10 +247,9 @@ For each source node of a generation, look up the same `logical_id` in the lates
 **Each test case is judged on what it claims, not on which section it came from.** A test's
 claims are the fact tokens in its own title, steps and expected result. Its status is:
 
-- **stale**: a cited section was removed, or one of the test's own facts appears in a cited
-  sentence that was rewritten or deleted. The facts in question are returned as
-  `invalidated_facts`.
-- **review**: a cited section changed, but not in any sentence holding a fact this test asserts.
+- **stale**: a cited section was removed, or one of the test's own facts is among the cited
+  sections' `invalidated_facts`. The facts in question are returned on the test case.
+- **review**: a cited section changed, but nothing this test asserts was invalidated.
 - **current**: every cited section is byte-for-byte unchanged (equal hash).
 
 The generation as a whole gets the worst status of its test cases. All of this is shown on every
@@ -204,17 +262,40 @@ Concretely, on v1 → v2 (shown by `demo.py` and asserted in `tests/test_api.py`
 | E3 auto-deflates "within 2 seconds" (4.2) | E3 row now says 1.5 s | **stale**, invalidated `2 seconds` |
 | E1 aborts and displays E1 (4.2) | same table, other rows changed, E6 added | **review** |
 | Inflates "in 40 mmHg increments" (3.2) | increment is now 30; "40 mmHg" survives only in a new explanatory sentence | **stale**, invalidated `40 mmhg` |
+| Aborts above a maximum of 299 mmHg (3.2) | same rewritten sentence, but 299 survived the rewrite | **review** |
 | Deflation steps ≈ 3 mmHg (3.2) | that sentence untouched | **review** |
 | Profile selection (3.1) | no change (only the page break differs) | **current** |
 
-Two design choices explain that table:
+Real response excerpt (`GET /generations/{id}` after v2 is ingested; generated from a selection of
+4.2 only, trimmed):
 
-- **Sentences, not tokens.** A first version compared only the tokens that disappeared from a
-  section. 3.2 broke it: "40 mmHg" is still in v2's text, so the 40 mmHg test would have looked
-  unaffected. What actually matters is that the sentence stating the rule was rewritten. So the
-  rule is "a fact you assert lives in a sentence that changed", which catches it.
-- **Nothing is auto-cleared.** Any change to a cited section yields at least `review`. Only an
-  identical hash yields `current`.
+```json
+"staleness": {"status": "stale", "generated_from_version": 1, "checked_against_version": 2,
+  "sources": [{"number": "4.2", "status": "changed", "severity": "material",
+               "facts_removed": ["2 seconds"], "facts_added": ["1.5 seconds", "e6", "e6", "not"],
+               "invalidated_facts": ["2 seconds"]}]},
+"test_cases": [
+  {"id": "TC-1", "expected_result": "E1 | ... | Aborts measurement, displays E1",
+   "staleness": "review", "invalidated_facts": []},
+  {"id": "TC-3", "expected_result": "E3 | ... | Auto-deflates within 2 seconds, displays E3",
+   "staleness": "stale", "invalidated_facts": ["2 seconds"]}, ...]
+```
+
+How that rule evolved (each step was forced by a real case in this manual):
+
+1. **Section-level** (first version): any material change to a cited section made every test
+   citing it stale. Table 4.2 broke this. One row changed, so all five error-code tests went
+   stale, including the four whose rows were untouched.
+2. **Vanished tokens**: stale only if a fact the test asserts disappeared from the section.
+   3.2 broke this. "40 mmHg" is still in v2 (in the new sentence "reduced from the original 40
+   mmHg"), so the 40 mmHg increment test looked unaffected, which is a false negative.
+3. **Facts in rewritten sentences**: stale if the asserted fact sits in any rewritten sentence.
+   This catches 3.2, but over-flags: 299 mmHg is in the same sentence and did not change.
+4. **Paired sentences** (current): pair each rewritten sentence with its rewrite and invalidate
+   only what the rewrite dropped. 3.2 gives exactly `40 mmHg`; the 299 test stays at review.
+
+**Nothing is auto-cleared.** Any change to a cited section yields at least `review`. Only an
+identical hash yields `current`.
 
 **Does a one-word change count the same as a changed pressure threshold?** No, but it is also never
 silently cleared. The heuristic can tell "2 seconds → 1.5 seconds" from "approximately → about".
@@ -227,10 +308,9 @@ Only an identical hash yields `current`.
 - **Facts are tokens, not meaning.** "increases" → "decreases" or "systolic" → "diastolic" carry no
   fact token. They still yield `review` (the section changed), never `stale`, so a human has to
   catch them.
-- **Over-flagging inside a rewritten sentence.** 3.2's rewritten sentence also holds 180 mmHg and
-  299 mmHg, which did not change. A test asserting only "max 299 mmHg" is marked stale too. This is
-  the safe direction, and the cheapest next step is pairing old and new sentences and comparing
-  facts within each pair.
+- **Sentence pairing is a threshold.** A rewrite that changes more than half of a sentence's words
+  is treated as a deletion, so all of its facts are invalidated (over-flagging, the safe side).
+  A sentence split into two can pair with only one half.
 - **Unit spelling.** "2 seconds" and "2 second" match, but "2 s" does not. A test written as "2 s"
   would drop from stale to review (never to current).
 - **The fact vocabulary is tuned to this manual** (mmHg, bpm, %, seconds, E-codes, requirement
@@ -306,8 +386,9 @@ of MongoDB; the reasons are in section 2.
 
 ## 7. What I'd do with more time
 
-- Pair old and new sentences (and table rows) and compare facts within each pair, so an unchanged
-  value inside a rewritten sentence is not flagged.
+- Run the generation step against several real models and record how often each validation rule
+  fires. Today the retry and grounding logic is proven with injected bad replies, not with
+  measured model behaviour.
 - Model explicit cross-references ("see 2.1, 4.3", "Section 4.2") as dependency edges, and include
   them in staleness.
 - An OCR fallback for scanned pages, and a two-column layout check.
