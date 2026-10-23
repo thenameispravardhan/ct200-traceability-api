@@ -1,6 +1,6 @@
 # CT-200 Traceability API: Approach
 
-Repository: https://github.com/thenameispravardhan/ct200-traceability
+Repository: https://github.com/thenameispravardhan/ct200-traceability-api
 
 ## 0. At a glance
 
