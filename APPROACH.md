@@ -125,7 +125,7 @@ audited even if the SQL rows were gone.
 
 **Why a JSON store and not MongoDB.** Generations are written once, never updated, read by selection
 or by node, and never joined with the tree. A directory of JSON files gives that with no server to
-run. The ceiling is the full scan on every read (marked with a `ponytail:` comment in `store.py`).
+run. The ceiling is the full scan on every read (marked with a `LIMIT:` comment in `store.py`).
 Past a few thousand generations, or with more than one API process, this belongs in MongoDB with
 indexes on `selection_id` and `sources.logical_id`. The document shape would not change.
 
@@ -357,7 +357,7 @@ Operationally, the next things to break are:
 **3. One input I did not handle, and what the system does with it.**
 
 A multi-column page. The parser sorts lines by vertical position (it assumes a single column, and
-says so in a `ponytail:` comment), so a two-column page would interleave the lines of both columns
+says so in a `LIMIT:` comment), so a two-column page would interleave the lines of both columns
 into nonsense paragraphs.
 
 This one is **not** detected: it would produce wrong body text and hashes with no warning. Only the

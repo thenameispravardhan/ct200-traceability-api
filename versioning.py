@@ -41,7 +41,7 @@ def ingest(db: Session, document: str, pdf: bytes) -> dict:
     old = nodes_of(db, prev.id) if prev else []
     matches = match(old, parsed)
 
-    # ponytail: version numbers race under concurrent ingests of the same document; the unique
+    # LIMIT: version numbers race under concurrent ingests of the same document; the unique
     # constraint turns that into an error rather than corruption. Serialize ingests if that matters.
     ver = Version(document=document, number=prev.number + 1 if prev else 1, file_sha256=sha,
                   title=title, warnings=warnings)
@@ -149,8 +149,8 @@ def staleness(db: Session, gen: dict) -> dict:
     for tc in gen["test_cases"]:
         cited = [by_id[i] for i in tc["source_node_ids"]]
         asserted = _anchors(_facts(" ".join([tc["title"], *tc["steps"], tc["expected_result"]])))
-        touched = _anchors(f for c in cited for f in c.get("invalidated_facts", []))
-        broken = sorted(asserted & touched)
+        touched = {f for c in cited for f in c.get("invalidated_facts", [])}
+        broken = sorted(f for f in touched if _anchors([f]) & asserted)
         if broken or any(c["status"] == "removed" for c in cited):
             status = "stale"
         else:
@@ -183,7 +183,7 @@ def _invalidated(old: list[str], new: list[str]) -> list[str]:
         if op in ("replace", "delete"):
             for s in old[i1:i2]:
                 best = max(new[j1:j2], key=lambda t: _sim(s, t), default=None)
-                # ponytail: 0.5 word-overlap pairs a rewrite with its original; a rewrite that changes
+                # LIMIT: 0.5 word-overlap pairs a rewrite with its original; a rewrite that changes
                 # more than half its words counts as deleted (all its facts invalidated), the safe side.
                 out += _facts(s) - (_facts(best) if best and _sim(s, best) >= 0.5 else Counter())
     return sorted(out)
@@ -194,6 +194,6 @@ def _facts(text: str) -> Counter:
 
 
 def _anchors(facts) -> set[str]:
-    # "2 seconds" and "2 second" are the same claim. ponytail: "2 s" vs "2 seconds" won't match,
+    # "2 seconds" and "2 second" are the same claim. LIMIT: "2 s" vs "2 seconds" won't match,
     # which downgrades stale -> review (never -> current); add a unit synonym table if that bites.
     return {f.rstrip("s") for f in facts}

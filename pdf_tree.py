@@ -93,7 +93,7 @@ def parse(src: str | bytes):
         if page.get_images():
             doc_warnings.append(f"page {pno}: embedded image(s) not extracted")
         tables = _tables(page)
-        # ponytail: single-column layout assumed, so sorting by y is reading order.
+        # LIMIT: single-column layout assumed, so sorting by y is reading order.
         events = [(r.y0, "table", rows) for r, rows in tables]
         events += [(l["y0"], "line", l) for l in _lines(page)
                    if not any(r.contains(fitz.Point(l["x"] + 1, (l["y0"] + l["y1"]) / 2)) for r, _ in tables)]

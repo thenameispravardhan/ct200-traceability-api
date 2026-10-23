@@ -92,7 +92,7 @@ def save_generation(gen: dict):
 
 
 def load_generations() -> list[dict]:
-    # ponytail: full directory scan per query; fine for hundreds, move to MongoDB with an index on
+    # LIMIT: full directory scan per query; fine for hundreds, move to MongoDB with an index on
     # selection_id / sources.logical_id when it isn't.
     if not GEN_DIR.exists():
         return []
