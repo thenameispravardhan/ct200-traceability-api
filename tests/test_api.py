@@ -52,12 +52,32 @@ def test_generation_validates_retries_and_dedupes(monkeypatch):
     S["gen"] = g
 
 
+def tc(expected, node, title="Inflation behaviour"):
+    return {"title": title, "steps": ["Start a measurement."], "expected_result": expected, "source_node_ids": [node]}
+
+
 def test_invalid_output_is_rejected_and_not_stored(monkeypatch):
-    bad = {"test_cases": [{"title": "Made up", "steps": ["x"], "expected_result": "something", "source_node_ids": [999]}] * 3}
-    monkeypatch.setattr(llm, "complete", lambda messages: json.dumps(bad))
+    n41 = nid("4.1")
+    replies = iter([
+        json.dumps({"test_cases": [tc("Valve vents the cuff", 999)] * 3}),                       # unknown node
+        json.dumps({"test_cases": [tc("Cuff vented within 5 seconds", n41)] * 3}),               # invented value
+        "```json\n{\"test_cases\": []}\n```",                                                    # too few
+    ])
+    monkeypatch.setattr(llm, "complete", lambda messages: next(replies))
     r = c.post(f"/selections/{S['sel']['id']}/generations", params={"force": True})
-    assert r.status_code == 502 and "999" in r.json()["detail"]["errors"][0]
+    errors = r.json()["detail"]["errors"]
+    assert r.status_code == 502 and "999" in errors[0] and "['5']" in errors[1] and "at least 3" in errors[2]
     assert len(c.get(f"/selections/{S['sel']['id']}/generations").json()) == 1
+
+
+def test_generation_for_inflation_section(monkeypatch):
+    n32 = nid("3.2")
+    sel = c.post("/selections", json={"name": "inflation", "node_ids": [n32]}).json()
+    cases = [tc("Inflates in 40 mmHg increments up to 299 mmHg", n32),
+             tc("Deflates in controlled steps of approximately 3 mmHg", n32),
+             tc("Deflation steps are approximately 3 mmHg", n32)]
+    monkeypatch.setattr(llm, "complete", lambda messages: json.dumps({"test_cases": cases}))
+    S["gen32"] = c.post(f"/selections/{sel['id']}/generations").json()
 
 
 def test_v2_reingest_flags_changes_and_staleness():
@@ -78,7 +98,15 @@ def test_v2_reingest_flags_changes_and_staleness():
     st = {s["number"]: s for s in g["staleness"]["sources"]}
     assert g["staleness"]["status"] == "stale" and g["staleness"]["checked_against_version"] == 2
     assert st["3.1"]["status"] == "current" and st["4.2"]["severity"] == "material"
-    for tc in g["test_cases"]:
-        cited = {s["number"] for s in g["staleness"]["sources"] if s["node_id"] in tc["source_node_ids"]}
-        assert tc["staleness"] == ("stale" if cited & {"4.2", "4.3"} else "current")
+    # Claim-level: in table 4.2 only the E3 row changed, so only the test asserting "2 seconds" is stale;
+    # tests of the untouched E1/E2 rows need review, tests of unchanged sections stay current.
+    for case in g["test_cases"]:
+        cited = {s["number"] for s in g["staleness"]["sources"] if s["node_id"] in case["source_node_ids"]}
+        want = "current" if not cited & {"4.2", "4.3"} else "stale" if "2 seconds" in case["expected_result"] else "review"
+        assert case["staleness"] == want, case
     assert [x["id"] for x in c.get(f"/nodes/{nid('4.2', 2)}/generations").json()] == [S["gen"]["id"]]
+
+    # 3.2 still contains "40 mmHg" in v2, but the increment sentence was rewritten: that test is stale.
+    g32 = c.get(f"/generations/{S['gen32']['id']}").json()
+    assert [t["staleness"] for t in g32["test_cases"]] == ["stale", "review", "review"]
+    assert "40 mmhg" in g32["test_cases"][0]["invalidated_facts"]

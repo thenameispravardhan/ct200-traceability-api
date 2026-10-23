@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 PROMPT_VERSION = "tc-v1"
 MAX_ATTEMPTS = 3
+NUM = re.compile(r"\d+(?:\.\d+)?")
 API_KEY = os.environ.get("LLM_API_KEY")
 BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.groq.com/openai/v1")  # any OpenAI-compatible API
 MODEL = os.environ.get("LLM_MODEL", "llama-3.3-70b-versatile") if API_KEY else "offline-stub"
@@ -22,7 +23,8 @@ steps and an observable, measurable expected result quoting the exact values fro
 Reply with ONE JSON object and nothing else, in exactly this shape:
 {"test_cases": [{"title": str, "steps": [str, ...], "expected_result": str, "source_node_ids": [int, ...]}]}
 Rules: 3 to 5 test cases. source_node_ids lists the [node N] ids whose text the test verifies;
-use only ids that appear in the input. Prefer boundary and failure-mode tests over happy paths."""
+use only ids that appear in the input. Every number in expected_result must appear in the cited
+sections. Prefer boundary and failure-mode tests over happy paths."""
 
 
 class TestCase(BaseModel):
@@ -49,7 +51,8 @@ def build_prompt(sources: list[dict]) -> str:
 
 def generate(sources: list[dict]) -> tuple[TestCaseSet, int, str]:
     """Returns (validated set, attempts used, raw reply). Raises GenerationFailed after MAX_ATTEMPTS."""
-    allowed = {s["node_id"] for s in sources}
+    text_by_id = {s["node_id"]: s["text"] for s in sources}
+    allowed = set(text_by_id)
     messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": build_prompt(sources)}]
     errors, raw = [], None
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -65,6 +68,13 @@ def generate(sources: list[dict]) -> tuple[TestCaseSet, int, str]:
             unknown = {i for tc in result.test_cases for i in tc.source_node_ids} - allowed
             if unknown:
                 raise ValueError(f"source_node_ids {sorted(unknown)} are not in the input; allowed: {sorted(allowed)}")
+            for k, tc in enumerate(result.test_cases, 1):
+                # Grounding: an expected result may only assert numbers its cited sections state.
+                cited = " ".join(text_by_id[i] for i in tc.source_node_ids)
+                invented = set(NUM.findall(tc.expected_result)) - set(NUM.findall(cited))
+                if invented:
+                    raise ValueError(f"test case {k} expected_result uses values {sorted(invented)} "
+                                     f"that are not in its cited sections {tc.source_node_ids}")
             return result, attempt, raw
         except (ValueError, ValidationError) as e:  # JSONDecodeError is a ValueError
             errors.append(f"attempt {attempt}: {e}"[:500])
