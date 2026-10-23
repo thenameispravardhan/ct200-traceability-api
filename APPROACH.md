@@ -185,14 +185,36 @@ For each source node of a generation, look up the same `logical_id` in the lates
 - different hash → `changed` (+ diff summary);
 - missing → `removed`.
 
-Each **test case** is judged on the nodes *it* cites:
+**Each test case is judged on what it claims, not on which section it came from.** A test's
+claims are the fact tokens in its own title, steps and expected result. Its status is:
 
-- **stale** if any cited node is removed or materially changed;
-- **review** if a cited node changed in wording only;
-- **current** otherwise.
+- **stale**: a cited section was removed, or one of the test's own facts appears in a cited
+  sentence that was rewritten or deleted. The facts in question are returned as
+  `invalidated_facts`.
+- **review**: a cited section changed, but not in any sentence holding a fact this test asserts.
+- **current**: every cited section is byte-for-byte unchanged (equal hash).
 
-The generation as a whole gets the worst status. This is shown on every retrieval endpoint, per
-source and per test case.
+The generation as a whole gets the worst status of its test cases. All of this is shown on every
+retrieval endpoint, per source and per test case.
+
+Concretely, on v1 → v2 (shown by `demo.py` and asserted in `tests/test_api.py`):
+
+| Test case (from v1) | v2 change | Status |
+|---|---|---|
+| E3 auto-deflates "within 2 seconds" (4.2) | E3 row now says 1.5 s | **stale**, invalidated `2 seconds` |
+| E1 aborts and displays E1 (4.2) | same table, other rows changed, E6 added | **review** |
+| Inflates "in 40 mmHg increments" (3.2) | increment is now 30; "40 mmHg" survives only in a new explanatory sentence | **stale**, invalidated `40 mmhg` |
+| Deflation steps ≈ 3 mmHg (3.2) | that sentence untouched | **review** |
+| Profile selection (3.1) | no change (only the page break differs) | **current** |
+
+Two design choices explain that table:
+
+- **Sentences, not tokens.** A first version compared only the tokens that disappeared from a
+  section. 3.2 broke it: "40 mmHg" is still in v2's text, so the 40 mmHg test would have looked
+  unaffected. What actually matters is that the sentence stating the rule was rewritten. So the
+  rule is "a fact you assert lives in a sentence that changed", which catches it.
+- **Nothing is auto-cleared.** Any change to a cited section yields at least `review`. Only an
+  identical hash yields `current`.
 
 **Does a one-word change count the same as a changed pressure threshold?** No, but it is also never
 silently cleared. The heuristic can tell "2 seconds → 1.5 seconds" from "approximately → about".
@@ -202,13 +224,17 @@ Only an identical hash yields `current`.
 
 **Known limits:**
 
-- **Node granularity.** In the demo, a test case for error code E1 is marked stale because table 4.2
-  changed (E3 timing, new E6), even though the E1 row did not change. This over-flags, which is the
-  safe direction, but at scale it causes alert fatigue. A fix would be row/sentence-level hashes, with
-  test cases citing those.
-- **Counting, not alignment.** In 3.2, "40 mmHg" moved into an explanatory sentence while "30 mmHg"
-  became the rule. The token counts only show `+30 mmHg` (40 is still present). It is still flagged
-  material, but the summary undersells the change.
+- **Facts are tokens, not meaning.** "increases" → "decreases" or "systolic" → "diastolic" carry no
+  fact token. They still yield `review` (the section changed), never `stale`, so a human has to
+  catch them.
+- **Over-flagging inside a rewritten sentence.** 3.2's rewritten sentence also holds 180 mmHg and
+  299 mmHg, which did not change. A test asserting only "max 299 mmHg" is marked stale too. This is
+  the safe direction, and the cheapest next step is pairing old and new sentences and comparing
+  facts within each pair.
+- **Unit spelling.** "2 seconds" and "2 second" match, but "2 s" does not. A test written as "2 s"
+  would drop from stale to review (never to current).
+- **The fact vocabulary is tuned to this manual** (mmHg, bpm, %, seconds, E-codes, requirement
+  words). Another device's units would need adding.
 - **Dependencies outside the selection are invisible.** 3.3 says "see 2.1, 4.3". A change in 4.3
   does not stale a test generated only from 3.3.
 - **Additions elsewhere.** New section 5.3 (Data Export) cannot stale anything, though it may
@@ -232,7 +258,15 @@ Only an identical hash yields `current`.
   - 3–5 test cases;
   - non-empty title, 1–12 steps, non-empty expected result, at least one source id;
   - every `source_node_id` must be one of the selection's nodes. A citation of a node the model was
-    not given is a hallucination and is rejected.
+    not given is a hallucination and is rejected;
+  - **grounding**: every number in an `expected_result` must appear in the sections that test
+    cites. "Auto-deflates within 5 seconds" against a spec that says 2 seconds is rejected and
+    retried, with the offending value named in the feedback.
+
+    For a medical device, a plausible invented threshold is the most dangerous kind of LLM output:
+    it is valid JSON, reads well and would pass a schema check. This turns it into a hard error.
+    The same numbers are what staleness keys on later, so the check also guarantees that every
+    asserted value can be traced back to the text.
 - On a parse or validation failure, the model is shown its own reply plus the exact validation error
   and asked again, up to **3 attempts**. Transport errors (429/5xx/timeouts) back off 2 s, then 4 s,
   and count as attempts.
@@ -272,15 +306,16 @@ of MongoDB; the reasons are in section 2.
 
 ## 7. What I'd do with more time
 
-- Sub-node traceability: hash table rows and sentences, so test cases cite those and the E1 test in
-  the example above stays current.
+- Pair old and new sentences (and table rows) and compare facts within each pair, so an unchanged
+  value inside a rewritten sentence is not flagged.
 - Model explicit cross-references ("see 2.1, 4.3", "Section 4.2") as dependency edges, and include
   them in staleness.
 - An OCR fallback for scanned pages, and a two-column layout check.
 - A golden-tree snapshot (`expected_tree_v1.json`) compared in CI, so any parser change that moves a
   node shows up as a diff.
-- An LLM-as-checker pass: confirm each expected result's numbers appear in the cited text. Today
-  the schema guarantees shape and valid citations, not faithfulness.
+- Extend grounding beyond numbers. Today an expected result can't invent a value, but it can still
+  invent a *behaviour* ("displays a warning"). An entailment check (rules or a second model) against
+  the cited sentence would close that.
 - MongoDB for generations, and a lock or queue around ingestion.
 
 ## 8. Decision log
@@ -304,10 +339,15 @@ golden-tree snapshot test.
 **2. Where did I choose simplicity over correctness because of time, and what breaks first in
 production?**
 
-Staleness is judged per section, and change severity comes from a token heuristic, not from
-alignment or semantics. What breaks first is *trust*: any edit to a large section (like the
-error-code table) marks every test citing it stale. After a few revisions full of false "stale"
-flags, reviewers start ignoring the flag, and then a real threshold change gets missed.
+The meaning of a change is approximated with a regex vocabulary of "fact tokens" (numbers + units,
+error codes, requirement words) instead of real semantic comparison. It is transparent, testable,
+deterministic and free. But it only knows the units of this manual, and it cannot see a meaning
+flip that involves no such token. Those cases land in `review`, which is honest but relies on a
+human reading the diff.
+
+What breaks first in production is reviewer trust in `review`: if most `review` flags turn out to be
+harmless rewording, people stop reading them, and then the one semantic flip gets missed. I would
+measure the false-review rate on real revisions before relying on it.
 
 Operationally, the next things to break are:
 - the JSON store's full scan per request;

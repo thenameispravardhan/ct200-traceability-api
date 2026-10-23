@@ -50,8 +50,8 @@ pytest -q
   skipped level, out-of-order numbering, body-sized heading versus numbered list, tables, page breaks
   and Unicode).
 - `tests/test_api.py`: the full v1 → selection → generation → v2 → staleness flow through the API,
-  plus the LLM failure policy (malformed reply → retry; invalid reply ×3 → 502 and nothing stored;
-  duplicate request → reused).
+  plus the LLM failure policy (malformed reply, unknown citation or invented value → retry; ×3 → 502, nothing stored;
+  duplicate request → reused) and claim-level staleness (the E3 test goes stale, the E1 test needs only review).
 
 ## The v1 → v2 re-ingestion flow
 
