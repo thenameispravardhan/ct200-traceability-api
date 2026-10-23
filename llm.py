@@ -57,7 +57,8 @@ def generate(sources: list[dict]) -> tuple[TestCaseSet, int, str]:
             raw = complete(messages)
         except httpx.HTTPError as e:  # rate limit / timeout / 5xx: back off and retry the same request
             errors.append(f"attempt {attempt}: transport error: {e!r}"[:300])
-            time.sleep(2 ** attempt)
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(2 ** attempt)
             continue
         try:
             result = TestCaseSet.model_validate(json.loads(_strip_fences(raw)))
